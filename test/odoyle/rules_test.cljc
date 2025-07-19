@@ -1093,3 +1093,228 @@
            (is (= 2 @*rule3-count))
            session)))))
 
+;; Test 1: Basic rule with :then block printing timestamp
+(deftest basic-rule-with-timestamp
+  (let [*output (atom [])]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::print-time
+             [:what
+              [::time ::total tt]
+              :then
+              (swap! *output conj tt)]}))
+        (o/insert ::time ::total 100)
+        o/fire-rules
+        ((fn [session]
+           (is (= [100] @*output))
+           session))
+        (o/insert ::time ::total 200)
+        o/fire-rules
+        ((fn [session]
+           (is (= [100 200] @*output))
+           session)))))
+
+;; Test 2: Updating session from inside rule with o/insert!
+(deftest updating-session-with-insert-bang
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::move-player
+           [:what
+            [::time ::total tt]
+            :then
+            (o/insert! ::player ::x tt)]
+           ::player-query
+           [:what
+            [::player ::x x]]}))
+      (o/insert ::time ::total 50)
+      o/fire-rules
+      ((fn [session]
+         (is (= 50 (:x (first (o/query-all session ::player-query)))))
+         session))))
+
+;; Test 3: {:then not=} behavior for conditional triggering  
+(deftest then-not-equals-conditional
+  (let [*count (atom 0)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::conditional-rule
+             [:what
+              [::player ::health health {:then not=}]
+              :then
+              (swap! *count inc)]}))
+        (o/insert ::player ::health 100)
+        o/fire-rules
+        ((fn [session]
+           (is (= 1 @*count))
+           session))
+        (o/insert ::player ::health 100) ; same value, should not trigger
+        o/fire-rules
+        ((fn [session]
+           (is (= 1 @*count))
+           session))
+        (o/insert ::player ::health 80) ; different value, should trigger
+        o/fire-rules
+        ((fn [session]
+           (is (= 2 @*count))
+           session)))))
+
+;; Test 4: Complex joins between id and value columns
+(deftest complex-weapon-damage-join
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::update-player-damage
+           [:what
+            [player-id ::weapon-id weapon-id]
+            [player-id ::strength  strength]
+            [weapon-id ::damage    damage]
+            :then
+            (o/insert! player-id ::damage (* damage strength))]
+           ::get-damage
+           [:what
+            [id ::damage damage]]}))
+      (o/insert ::player ::weapon-id ::sword)
+      (o/insert ::player ::strength 10)
+      (o/insert ::sword ::damage 5)
+      o/fire-rules
+      ((fn [session]
+         (is (= 50 (:damage (first (o/query-all session ::get-damage)))))
+         session))))
+
+;; Test 5: Bulk insertion with integer IDs  
+(deftest bulk-insertion-with-integers
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::character
+           [:what
+            [id ::x x]
+            [id ::y y]]}))
+      ((fn [session]
+         (o/fire-rules
+           (reduce (fn [session id]
+                     (o/insert session id {::x (+ id 10) ::y (+ id 20)}))
+                   session
+                   (range 3)))))
+      ((fn [session]
+         (let [characters (o/query-all session ::character)]
+           (is (= 3 (count characters)))
+           (is (= #{0 1 2} (set (map :id characters))))
+           session)))))
+
+;; Test 6: Derived facts with then-finally from README example
+(deftest derived-facts-all-characters
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::character
+           [:what
+            [id ::x x]
+            [id ::y y]
+            :then-finally
+            (->> (o/query-all session ::character)
+                 (o/insert session ::derived ::all-characters)
+                 o/reset!)]
+           ::print-all-characters
+           [:what
+            [::derived ::all-characters all-characters]]}))
+      (o/insert ::player {::x 20 ::y 15})
+      (o/insert ::enemy {::x 5 ::y 5})
+      o/fire-rules
+      ((fn [session]
+         (let [all-chars (:all-characters (first (o/query-all session ::print-all-characters)))]
+           (is (= 2 (count all-chars)))
+           (is (some #(= ::player (:id %)) all-chars))
+           (is (some #(= ::enemy (:id %)) all-chars))
+           session)))))
+
+;; Test 7: Serialization/deserialization of session facts
+(deftest session-fact-serialization
+  (let [rules (o/ruleset
+                {::character
+                 [:what
+                  [id ::x x]
+                  [id ::y y]]})]
+    (-> (reduce o/add-rule (o/->session) rules)
+        (o/insert ::player {::x 20 ::y 15})
+        (o/insert ::enemy {::x 5 ::y 5})
+        ((fn [session]
+           (let [facts (o/query-all session)
+                 new-session (reduce o/add-rule (o/->session) rules)
+                 restored-session (reduce o/insert new-session facts)]
+             (is (= 2 (count (o/query-all restored-session ::character))))
+             restored-session))))))
+
+;; Test 8: Performance pattern with derived character facts
+(deftest performance-derived-character-pattern
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::character
+           [:what
+            [id ::x x]
+            [id ::y y]
+            :then
+            (o/insert! id ::character match)]
+           ::move-character
+           [:what
+            [::time ::delta     dt]
+            [id     ::character ch {:then false}]
+            :then
+            (o/insert! id {::x (+ (:x ch) dt) ::y (+ (:y ch) dt)})]}))
+      (o/insert ::player {::x 10 ::y 5})
+      (o/insert ::time ::delta 2)
+      o/fire-rules
+      ((fn [session]
+         (is (= 12 (:x (first (o/query-all session ::character)))))
+         (is (= 7 (:y (first (o/query-all session ::character)))))
+         session))))
+
+;; Test 9: Conditions with external atom values
+(deftest conditions-with-external-atoms
+  (let [*allow-rule (atom false)
+        *count (atom 0)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::conditional-external
+             [:what
+              [::player ::action action]
+              :when
+              @*allow-rule
+              :then
+              (swap! *count inc)]}))
+        (o/insert ::player ::action "move")
+        o/fire-rules
+        ((fn [session]
+           (is (= 0 @*count))
+           (reset! *allow-rule true)
+           session))
+        (o/insert ::player ::action "attack")
+        o/fire-rules
+        ((fn [session]
+           (is (= 1 @*count))
+           session)))))
+
+;; Test 10: Multi-step cascading rule insertions
+(deftest multi-step-cascading-insertions
+  (let [*final-value (atom nil)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::step1
+             [:what
+              [::trigger ::start value]
+              :then
+              (o/insert! ::intermediate ::step1 (* value 2))]
+             ::step2
+             [:what
+              [::intermediate ::step1 value]
+              :then
+              (o/insert! ::intermediate ::step2 (+ value 10))]
+             ::step3
+             [:what
+              [::intermediate ::step2 value]
+              :then
+              (o/insert! ::final ::result value)
+              (reset! *final-value value)]}))
+        (o/insert ::trigger ::start 5)
+        o/fire-rules
+        ((fn [session]
+           (is (= 20 @*final-value)) ; (5 * 2) + 10 = 20
+           session)))))
+

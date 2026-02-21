@@ -132,6 +132,8 @@ This is no longer necessary, because it is accessible via `match` directly."}
                     rule-name->node-id ;; map of rule name -> the id of the associated MemoryNode
                     node-id->rule-name ;; map of the id of a MemoryNode -> the associated rule name
                     id-attr-nodes ;; map of id+attr -> set of alpha node paths
+                    fact-store ;; map of id -> map of attr -> {:current value :alive? boolean :history [values]}
+                    attr-index ;; map of attr -> set of [id value] pairs for live facts
                     then-queue ;; set of (MemoryNode id, id+attrs) that need executed
                     then-finally-queue ;; set of MemoryNode ids that need executed
                     rule-meta-store ;; map of rule-name -> {attr -> value} for meta-rule facts
@@ -310,6 +312,7 @@ This is no longer necessary, because it is accessible via `match` directly."}
 (declare remove-rule)
 (declare remove-rule-safe)
 (declare insert-meta-facts-into-rete)
+(declare meta-attr?)
 
 (defn- left-activate-join-node
   ([session node-id id+attrs vars token]
@@ -581,6 +584,101 @@ This is no longer necessary, because it is accessible via `match` directly."}
                            cycles)
                          \newline "Try using {:then false} to prevent triggering rules in an infinite loop.")
                     {}))))
+
+(defn- remove-from-attr-index [attr-index attr id val]
+  (let [new-pairs (disj (get attr-index attr #{}) [id val])]
+    (if (seq new-pairs)
+      (assoc attr-index attr new-pairs)
+      (dissoc attr-index attr))))
+
+(defn- store-insert
+  [fact-store attr-index id attr val]
+  (let [entry (get-in fact-store [id attr])
+        live-entry? (and entry (:alive? entry))
+        old-val (:current entry)
+        new-history (if live-entry?
+                      (conj (or (:history entry) []) old-val)
+                      (or (:history entry) []))
+        fact-store (assoc-in fact-store [id attr]
+                             {:current val
+                              :alive? true
+                              :history new-history})
+        attr-index (if live-entry?
+                     (remove-from-attr-index attr-index attr id old-val)
+                     attr-index)
+        attr-index (update attr-index attr (fnil conj #{}) [id val])]
+    [fact-store attr-index]))
+
+(defn- store-retract
+  [fact-store attr-index id attr]
+  (let [entry (get-in fact-store [id attr])]
+    (if (and entry (:alive? entry))
+      (let [old-val (:current entry)
+            fact-store (assoc-in fact-store [id attr]
+                                 {:current nil
+                                  :alive? false
+                                  :history (conj (or (:history entry) []) old-val)})
+            attr-index (remove-from-attr-index attr-index attr id old-val)]
+        [fact-store attr-index])
+      [fact-store attr-index])))
+
+(defn- store-purge
+  [fact-store attr-index id attr]
+  (let [entry (get-in fact-store [id attr])]
+    (if entry
+      (let [fact-store (update fact-store id dissoc attr)
+            fact-store (if (seq (get fact-store id))
+                         fact-store
+                         (dissoc fact-store id))
+            attr-index (if (:alive? entry)
+                         (remove-from-attr-index attr-index attr id (:current entry))
+                         attr-index)]
+        [fact-store attr-index])
+      [fact-store attr-index])))
+
+(defn- store-purge-attrs
+  [fact-store attr-index attr-set]
+  (reduce
+    (fn [[fact-store attr-index] attr]
+      [(reduce-kv
+         (fn [updated-store id attr->entry]
+           (if (clojure.core/contains? attr->entry attr)
+             (let [next-entry (dissoc attr->entry attr)]
+               (if (seq next-entry)
+                 (assoc updated-store id next-entry)
+                 updated-store))
+             (assoc updated-store id attr->entry)))
+         {}
+         fact-store)
+       (dissoc attr-index attr)])
+    [fact-store attr-index]
+    attr-set))
+
+(defn- store-query
+  ([fact-store]
+   (store-query fact-store {}))
+  ([fact-store {:keys [include-meta? include-history?]}]
+   (reduce-kv
+     (fn [result id attr->entry]
+       (let [filtered-attrs (reduce-kv
+                              (fn [attrs attr entry]
+                                (if (and (or include-meta? (not (meta-attr? attr)))
+                                         (or include-history? (:alive? entry)))
+                                  (assoc attrs attr (if include-history?
+                                                      entry
+                                                      (:current entry)))
+                                  attrs))
+                              {}
+                              attr->entry)]
+         (if (seq filtered-attrs)
+           (assoc result id filtered-attrs)
+           result)))
+     {}
+     fact-store)))
+
+(defn- store-lookup-attr
+  [attr-index attr]
+  (get attr-index attr #{}))
 
 (def ^:private ^:dynamic *mutable-session* nil)
 (def ^:private ^:dynamic *firing-rule-name* nil)
@@ -1069,6 +1167,8 @@ This is no longer necessary, because it is accessible via `match` directly."}
      :rule-name->node-id {}
      :node-id->rule-name {}
      :id-attr-nodes {}
+     :fact-store {}
+     :attr-index {}
      :then-queue #{}
      :then-finally-queue #{}
      :rule-meta-store {}
@@ -1274,4 +1374,3 @@ This is no longer necessary, because it is accessible via `match` directly."}
                   (fn wrap-then-finally [f]
                     (fn [session]
                       (then-finally-fn f session))))))
-

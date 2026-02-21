@@ -1957,3 +1957,103 @@
            (is (= #{::tracker1 ::domain ::tracker2} @*tracker2-rules))
            session)))))
 
+#?(:clj
+   (do
+     (defn- call-store-helper [sym & args]
+       (apply (deref (ns-resolve 'odoyle.rules sym)) args))
+
+     (deftest store-insert-on-empty-store
+       (let [[fact-store attr-index] (call-store-helper 'store-insert
+                                                        {}
+                                                        {}
+                                                        ::user
+                                                        ::name
+                                                        "Ada")]
+         (is (= {::user {::name {:current "Ada" :alive? true :history []}}}
+                fact-store))
+         (is (= {::name #{[::user "Ada"]}}
+                attr-index))))
+
+     (deftest store-insert-updates-history-and-index
+       (let [fact-store {::user {::name {:current "Ada" :alive? true :history []}}}
+             attr-index {::name #{[::user "Ada"]}}
+             [fact-store attr-index] (call-store-helper 'store-insert
+                                                        fact-store
+                                                        attr-index
+                                                        ::user
+                                                        ::name
+                                                        "Grace")]
+         (is (= {:current "Grace" :alive? true :history ["Ada"]}
+                (get-in fact-store [::user ::name])))
+         (is (= {::name #{[::user "Grace"]}}
+                attr-index))))
+
+     (deftest store-retract-tombstones-and-noops-when-already-dead
+       (let [fact-store {::user {::name {:current "Ada" :alive? true :history []}}}
+             attr-index {::name #{[::user "Ada"]}}
+             [fact-store attr-index] (call-store-helper 'store-retract fact-store attr-index ::user ::name)
+             [fact-store-2 attr-index-2] (call-store-helper 'store-retract fact-store attr-index ::user ::name)]
+         (is (= {:current nil :alive? false :history ["Ada"]}
+                (get-in fact-store [::user ::name])))
+         (is (= {} attr-index))
+         (is (= fact-store fact-store-2))
+         (is (= attr-index attr-index-2))))
+
+     (deftest store-purge-hard-deletes-entry-and-index
+       (let [fact-store {::user {::name {:current "Ada" :alive? true :history []}}}
+             attr-index {::name #{[::user "Ada"]}}
+             [fact-store attr-index] (call-store-helper 'store-purge fact-store attr-index ::user ::name)]
+         (is (= {} fact-store))
+         (is (= {} attr-index))))
+
+     (deftest store-purge-attrs-removes-all-facts-for-attrs
+       (let [fact-store {::u1 {::name {:current "Ada" :alive? true :history []}
+                               ::age {:current 42 :alive? true :history []}}
+                         ::u2 {::name {:current nil :alive? false :history ["Grace"]}
+                               ::color {:current "blue" :alive? true :history []}}}
+             attr-index {::name #{[::u1 "Ada"]}
+                         ::age #{[::u1 42]}
+                         ::color #{[::u2 "blue"]}}
+             [fact-store attr-index] (call-store-helper 'store-purge-attrs
+                                                        fact-store
+                                                        attr-index
+                                                        #{::name ::age})]
+         (is (= {::u2 {::color {:current "blue" :alive? true :history []}}}
+                fact-store))
+         (is (= {::color #{[::u2 "blue"]}}
+                attr-index))))
+
+     (deftest store-query-respects-meta-and-history-options
+       (let [fact-store {::u1 {::name {:current "Ada" :alive? true :history []}
+                               ::o/rule {:current true :alive? true :history []}
+                               ::age {:current nil :alive? false :history [42]}}
+                         ::u2 {::name {:current "Grace" :alive? true :history []}}}]
+         (is (= {::u1 {::name "Ada"}
+                 ::u2 {::name "Grace"}}
+                (call-store-helper 'store-query fact-store {})))
+         (is (= {::u1 {::name "Ada"
+                       ::o/rule true}
+                 ::u2 {::name "Grace"}}
+                (call-store-helper 'store-query fact-store {:include-meta? true})))
+         (is (= {::u1 {::name {:current "Ada" :alive? true :history []}
+                       ::age {:current nil :alive? false :history [42]}}
+                 ::u2 {::name {:current "Grace" :alive? true :history []}}}
+                (call-store-helper 'store-query fact-store {:include-history? true})))
+         (is (= {::u1 {::name {:current "Ada" :alive? true :history []}
+                       ::o/rule {:current true :alive? true :history []}
+                       ::age {:current nil :alive? false :history [42]}}
+                 ::u2 {::name {:current "Grace" :alive? true :history []}}}
+                (call-store-helper 'store-query fact-store {:include-meta? true
+                                                            :include-history? true})))))
+
+     (deftest store-lookup-attr-returns-live-id-value-pairs
+       (let [attr-index {::name #{[::u1 "Ada"] [::u2 "Grace"]}}]
+         (is (= #{[::u1 "Ada"] [::u2 "Grace"]}
+                (call-store-helper 'store-lookup-attr attr-index ::name)))
+         (is (= #{}
+                (call-store-helper 'store-lookup-attr attr-index ::missing)))))
+
+     (deftest new-session-initializes-empty-store-and-index
+       (let [session (o/->session)]
+         (is (= {} (:fact-store session)))
+         (is (= {} (:attr-index session)))))))

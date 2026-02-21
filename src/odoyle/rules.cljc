@@ -589,7 +589,10 @@ This is no longer necessary, because it is accessible via `match` directly."}
 
 (defn- initialize-rule-against-session
   "Retroactively initializes a newly added rule against all existing facts in the session.
-  Walks the rule's join nodes and replays matching facts from their alpha nodes."
+  Walks the rule's join nodes and replays matching facts from their alpha nodes.
+  For each join node, finds candidate facts from the session (even if they reside in
+  ancestor alpha nodes) and replays them through the RETE network to populate the new
+  rule's beta nodes."
   [session rule-name]
   (let [leaf-node-id (get-in session [:rule-name->node-id rule-name])]
     (if leaf-node-id
@@ -603,25 +606,50 @@ This is no longer necessary, because it is accessible via `match` directly."}
                   (if-let [parent-id (:parent-id node)]
                     (recur parent-id ids)
                     ids))))]
-        ;; for each join node, replay all facts from its alpha node
+        ;; replay in root-to-leaf order so parent memory nodes have matches
+        ;; before child join nodes try to join against them
         (reduce
           (fn [session join-node-id]
             (let [join-node (get-in session [:beta-nodes join-node-id])
-                  alpha-node (get-in session (:alpha-node-path join-node))]
+                  alpha-node-path (:alpha-node-path join-node)
+                  alpha-node (get-in session alpha-node-path)
+                  ;; if the alpha node has facts, use them directly.
+                  ;; otherwise, find matching facts from ancestor alpha nodes.
+                  facts (if (seq (:facts alpha-node))
+                          (mapcat vals (vals (:facts alpha-node)))
+                          ;; walk all facts in session and check which ones reach this alpha path
+                          (let [condition (:condition join-node)
+                                ;; collect the test criteria from the alpha node and its ancestors
+                                tests (loop [path alpha-node-path
+                                             ts []]
+                                        (let [node (get-in session path)]
+                                          (if (:test-field node)
+                                            (recur (subvec path 0 (- (count path) 2))
+                                                   (conj ts [(:test-field node) (:test-value node)]))
+                                            ts)))]
+                            ;; scan all session facts and filter by alpha node criteria
+                            (for [[[id attr] node-paths] (:id-attr-nodes session)
+                                  :let [any-path (first node-paths)
+                                        fact-node (get-in session any-path)
+                                        fact (get-in fact-node [:facts id attr])]
+                                  :when fact
+                                  :when (every? (fn [[field test-val]]
+                                                  (case field
+                                                    :id (= (:id fact) test-val)
+                                                    :attr (= (:attr fact) test-val)
+                                                    :value (= (:value fact) test-val)))
+                                                tests)]
+                              fact)))]
               (reduce
-                (fn [session [_id attr->fact]]
-                  (reduce
-                    (fn [session [_attr fact]]
-                      (right-activate-join-node
-                        session join-node-id
-                        (get-id-attr fact)
-                        (->Token fact :insert nil)))
-                    session
-                    attr->fact))
+                (fn [session fact]
+                  (right-activate-join-node
+                    session join-node-id
+                    (get-id-attr fact)
+                    (->Token fact :insert nil)))
                 session
-                (:facts alpha-node))))
+                facts)))
           session
-          join-node-ids))
+          (rseq join-node-ids)))
       session)))
 
 ;; public

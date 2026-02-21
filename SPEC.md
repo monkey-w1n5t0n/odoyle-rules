@@ -373,3 +373,71 @@ re-populated automatically by `add-rule`.
     o/fire-rules)
 ;; => ::player-getter rule now exists and matches all ::player entities
 ```
+
+---
+
+## Prototype Results
+
+### What works
+
+1. **Rule-metadata insertion**: Every `add-rule` call populates `rule-meta-store` with
+   structured metadata. This survives even when no meta-rule exists yet, solving the
+   "silent discard" problem.
+
+2. **Retroactive initialization**: Meta-rules added after domain rules correctly see all
+   prior rules' metadata. Domain rules added after meta-rules also trigger meta-rules.
+   Order of `add-rule` calls doesn't matter.
+
+3. **`add-rule!` / `remove-rule!`**: Deferred rule manipulation works from inside `:then`
+   and `:then-finally` blocks. The FIFO drain model is predictable and the recursion
+   limit correctly catches infinite loops.
+
+4. **Retroactive fact replay**: When `add-rule!` creates a new rule, it retroactively
+   sees facts already in the session's alpha nodes. This enables the schema-driven
+   getter rule pattern from the spec.
+
+5. **Truth maintenance**: Derived rules are automatically removed when their source rule
+   is removed. `{:root? true}` correctly prevents cascading. Deep chains (A->B->C) cascade correctly.
+
+6. **`query-all` unchanged**: Domain-only serialization works. `query-all` excludes
+   meta-facts. `query-all-meta` provides explicit metadata access.
+
+7. **Rule analysis**: Meta-rules can join across `::o/conditions` to detect patterns like
+   "two rules watching the same attribute" — this works as designed.
+
+### What surprised us
+
+1. **Fact discard is the hardest problem**: O'Doyle's core design choice — silently discard
+   facts matching no rule — means retroactive initialization only works for facts that are
+   already tracked by at least one other rule. If the ONLY rule watching `::color` is one
+   created by `add-rule!`, it won't see pre-existing `::color` facts because they were
+   discarded at insert time. This is a fundamental limitation of the RETE approach. Workaround:
+   ensure "keeper" rules exist, or insert facts after the generated rules are created.
+
+2. **`::o/rule` spec conflict**: The existing `::rule` spec (used for parsing rule bodies)
+   conflicts with the `::o/rule` meta-attribute. We bypassed this by having
+   `insert-meta-facts-into-rete` call the internal insert path directly, avoiding spec
+   instrumentation. A production version might use a different attribute namespace to avoid this.
+
+3. **Alpha node sharing is both feature and challenge**: When a new rule shares alpha nodes
+   with existing rules, facts are already present in the alpha node but need to be replayed
+   through the new rule's join nodes. The solution (walking join nodes and replaying from
+   alpha node facts) works but required careful distinction between alpha-level and
+   beta-level activation.
+
+### Performance observations
+
+Adding 100 rules with metadata takes negligible additional time. Each `add-rule` call
+adds 6 entries to `rule-meta-store` (a plain map), which is O(1) per rule. RETE insertion
+of metadata facts is also O(1) when no meta-rule exists (facts are silently discarded).
+When meta-rules exist, cost is proportional to the number of meta-rules times the number
+of rules — acceptable for typical session sizes.
+
+### What to change before production
+
+1. **Consider a separate namespace for meta-attributes** to avoid the `::rule` spec conflict.
+2. **Add `::o/rule-name` as a convenience** despite the spec's note about redundancy — it
+   simplifies queries for users who don't understand the EAV binding pattern.
+3. **Consider a fact retention store** for complete retroactive initialization — this would
+   solve the "facts matching no rule are lost" limitation but adds memory cost.
+4. **ClojureScript testing** is needed before merging.

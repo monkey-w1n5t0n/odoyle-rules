@@ -1,5 +1,6 @@
 (ns odoyle.rules-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.set]
             [odoyle.rules :as o]
             [clojure.spec.test.alpha :as st]))
 
@@ -1092,4 +1093,539 @@
            (is (= 1 @*rule2-count))
            (is (= 2 @*rule3-count))
            session)))))
+
+;; === Meta-rules (Phase 1) ===
+
+(deftest rule-meta-store-populated-on-add-rule
+  (let [rules (o/ruleset
+                {::rule1
+                 [:what
+                  [id ::color color]
+                  :when
+                  (pos? 1)
+                  :then
+                  nil]
+                 ::rule2
+                 [:what
+                  [id ::height height]]})
+        session (reduce o/add-rule (o/->session) rules)
+        meta1 (o/query-all-meta session ::rule1)
+        meta2 (o/query-all-meta session ::rule2)]
+    ;; rule1 has all three blocks
+    (is (true? (::o/rule meta1)))
+    (is (true? (::o/has-when? meta1)))
+    (is (true? (::o/has-then? meta1)))
+    (is (false? (::o/has-then-finally? meta1)))
+    ;; rule2 only has :what
+    (is (true? (::o/rule meta2)))
+    (is (false? (::o/has-when? meta2)))
+    (is (false? (::o/has-then? meta2)))
+    (is (false? (::o/has-then-finally? meta2)))
+    ;; conditions-raw round-trips
+    (is (= 1 (count (::o/conditions-raw meta1))))
+    (is (= 1 (count (::o/conditions-raw meta2))))
+    ;; conditions structured has expected shape
+    (let [cond1 (first (::o/conditions meta1))]
+      (is (= :binding (:kind (:id cond1))))
+      (is (= :value (:kind (:attr cond1))))
+      (is (= ::color (get-in cond1 [:attr :value])))
+      (is (= :binding (:kind (:value cond1)))))))
+
+(deftest query-all-meta-returns-all-metadata
+  (let [rules (o/ruleset
+                {::rule1
+                 [:what
+                  [id ::color color]]
+                 ::rule2
+                 [:what
+                  [id ::height height]]})
+        session (reduce o/add-rule (o/->session) rules)
+        all-meta (o/query-all-meta session)]
+    ;; 6 attrs per rule * 2 rules = 12 tuples
+    (is (= 12 (count all-meta)))
+    ;; each tuple is [rule-name attr value]
+    (is (every? #(= 3 (count %)) all-meta))))
+
+(deftest query-all-excludes-meta-facts
+  (let [*seen-rules (atom [])
+        rules (o/ruleset
+                {::domain-rule
+                 [:what
+                  [id ::color color]]
+                 ::meta-watcher
+                 [:what
+                  [rule-name ::o/rule true]
+                  :then
+                  (swap! *seen-rules conj rule-name)]})
+        session (-> (reduce o/add-rule (o/->session) rules)
+                    (o/insert ::bob ::color "blue")
+                    o/fire-rules)
+        all-facts (o/query-all session)]
+    ;; query-all should only have domain facts, no ::o/ attributes
+    (is (every? (fn [[_id attr _val]]
+                  (not (and (qualified-keyword? attr)
+                            (= (namespace attr) (namespace ::o/rule)))))
+                all-facts))
+    ;; there should be exactly 1 domain fact
+    (is (= 1 (count all-facts)))))
+
+(deftest meta-rule-added-last-sees-prior-rules
+  (let [*seen-rules (atom [])]
+    (-> (o/->session)
+        ;; add domain rules first
+        (o/add-rule (first (o/ruleset {::rule1 [:what [id ::color color]]})))
+        (o/add-rule (first (o/ruleset {::rule2 [:what [id ::height height]]})))
+        ;; add meta-rule last — it should retroactively see both prior rules
+        (o/add-rule (first (o/ruleset
+                             {::meta-watcher
+                              [:what
+                               [rule-name ::o/rule true]
+                               :then
+                               (swap! *seen-rules conj rule-name)]})))
+        o/fire-rules
+        ((fn [session]
+           ;; should have seen all 3 rules (including itself)
+           (is (= 3 (count @*seen-rules)))
+           (is (contains? (set @*seen-rules) ::rule1))
+           (is (contains? (set @*seen-rules) ::rule2))
+           (is (contains? (set @*seen-rules) ::meta-watcher))
+           session)))))
+
+(deftest meta-rule-added-first-also-works
+  (let [*seen-rules (atom [])]
+    (-> (o/->session)
+        ;; add meta-rule first
+        (o/add-rule (first (o/ruleset
+                             {::meta-watcher
+                              [:what
+                               [rule-name ::o/rule true]
+                               :then
+                               (swap! *seen-rules conj rule-name)]})))
+        ;; add domain rules after
+        (o/add-rule (first (o/ruleset {::rule1 [:what [id ::color color]]})))
+        (o/add-rule (first (o/ruleset {::rule2 [:what [id ::height height]]})))
+        o/fire-rules
+        ((fn [session]
+           ;; should have seen all 3 rules
+           (is (= 3 (count @*seen-rules)))
+           (is (contains? (set @*seen-rules) ::rule1))
+           (is (contains? (set @*seen-rules) ::rule2))
+           (is (contains? (set @*seen-rules) ::meta-watcher))
+           session)))))
+
+(deftest meta-rule-can-query-conditions
+  (let [*rules-watching-color (atom [])]
+    (-> (o/->session)
+        (o/add-rule (first (o/ruleset {::color-rule [:what [id ::color color]]})))
+        (o/add-rule (first (o/ruleset {::height-rule [:what [id ::height height]]})))
+        (o/add-rule (first (o/ruleset
+                             {::condition-watcher
+                              [:what
+                               [rule-name ::o/rule true]
+                               [rule-name ::o/conditions conditions]
+                               :when
+                               (some #(= (get-in % [:attr :value]) ::color) conditions)
+                               :then
+                               (swap! *rules-watching-color conj rule-name)]})))
+        o/fire-rules
+        ((fn [session]
+           ;; only ::color-rule watches ::color
+           (is (= [::color-rule] @*rules-watching-color))
+           session)))))
+
+(deftest conditions-raw-reconstruction
+  (let [rules (o/ruleset
+                {::complex-rule
+                 [:what
+                  [id ::color "blue"]
+                  [id ::height height {:then false}]
+                  [::alice ::left-of target]]})
+        session (reduce o/add-rule (o/->session) rules)
+        meta (o/query-all-meta session ::complex-rule)
+        raw (::o/conditions-raw meta)]
+    ;; 3 conditions
+    (is (= 3 (count raw)))
+    ;; first condition: [id ::color "blue"]
+    (is (symbol? (first (nth raw 0))))  ;; id is a binding
+    (is (= ::color (second (nth raw 0))))  ;; attr is literal
+    (is (= "blue" (nth (nth raw 0) 2)))  ;; value is literal
+    ;; second condition has opts
+    (is (= 4 (count (nth raw 1))))  ;; [id ::height height {:then false}]
+    ;; third condition: [::alice ::left-of target]
+    (is (= ::alice (first (nth raw 2))))  ;; id is literal
+    (is (= ::left-of (second (nth raw 2))))  ;; attr is literal
+    (is (symbol? (nth (nth raw 2) 2)))))  ;; value is a binding
+
+;; === Phase 2: add-rule! and deferred queue ===
+
+(deftest add-rule!-in-then-block
+  (let [*generated-fired (atom false)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::trigger
+             [:what
+              [::trigger ::go? true]
+              :then
+              (o/add-rule!
+                (o/->rule ::generated
+                  {:what [['id ::color 'color]]
+                   :then (fn [session match]
+                           (reset! *generated-fired true))}))]}))
+        (o/insert ::trigger ::go? true)
+        o/fire-rules ;; this drains the deferred queue and adds ::generated
+        ((fn [session]
+           ;; the generated rule should exist now
+           (is (get-in session [:rule-name->node-id ::generated]))
+           session))
+        ;; now insert a fact that the generated rule watches
+        (o/insert ::bob ::color "blue")
+        o/fire-rules
+        ((fn [session]
+           ;; the generated rule should have fired
+           (is @*generated-fired)
+           ;; can query it
+           (is (= 1 (count (o/query-all session ::generated))))
+           session)))))
+
+(deftest remove-rule!-in-then-block
+  (let [*rule2-count (atom 0)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::rule1
+             [:what
+              [::trigger ::remove? true]
+              :then
+              (o/remove-rule! ::rule2)]
+             ::rule2
+             [:what
+              [id ::color color]
+              :then
+              (swap! *rule2-count inc)]}))
+        (o/insert ::bob ::color "blue")
+        o/fire-rules
+        ((fn [session]
+           (is (= 1 @*rule2-count))
+           session))
+        ;; trigger removal of rule2
+        (o/insert ::trigger ::remove? true)
+        o/fire-rules
+        ((fn [session]
+           ;; rule2 should have been removed after fire-rules drained the deferred queue
+           (is (thrown? #?(:clj Exception :cljs js/Error)
+                        (o/query-all session ::rule2)))
+           session))
+        ;; inserting a new color fact should NOT trigger rule2 (it's removed)
+        (o/insert ::bob ::color "red")
+        o/fire-rules
+        ((fn [session]
+           ;; count should still be 1 (only the initial firing)
+           (is (= 1 @*rule2-count))
+           session)))))
+
+(deftest interleaved-add-then-remove-same-rule
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::trigger
+           [:what
+            [::trigger ::go? true]
+            :then
+            ;; add then remove the same rule
+            (o/add-rule!
+              (o/->rule ::ephemeral
+                {:what [['id ::color 'color]]}))
+            (o/remove-rule! ::ephemeral)]}))
+      (o/insert ::trigger ::go? true)
+      o/fire-rules
+      ((fn [session]
+         ;; net result: rule should not exist
+         (is (thrown? #?(:clj Exception :cljs js/Error)
+                      (o/query-all session ::ephemeral)))
+         session))))
+
+(deftest remove-rule-safe-doesnt-throw
+  ;; remove-rule! of an already-removed rule should not throw in drain context
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::trigger1
+           [:what
+            [::trigger ::go? true]
+            :then
+            (o/remove-rule! ::target)]
+           ::trigger2
+           [:what
+            [::trigger ::go? true]
+            :then
+            ;; this also tries to remove ::target — should not throw
+            (o/remove-rule! ::target)]
+           ::target
+           [:what
+            [id ::color color]]}))
+      (o/insert ::trigger ::go? true)
+      o/fire-rules
+      ((fn [session]
+         ;; target should be gone
+         (is (thrown? #?(:clj Exception :cljs js/Error)
+                      (o/query-all session ::target)))
+         session))))
+
+(deftest add-rule!-retroactive-init-with-existing-facts
+  ;; When add-rule! creates a rule, it should see facts already in the session
+  ;; (facts that are in id-attr-nodes because they match other rules)
+  (let [*generated-fired (atom false)
+        *seen-color (atom nil)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::keeper
+             [:what
+              [id ::color color]]
+             ::trigger
+             [:what
+              [::trigger ::go? true]
+              :then
+              (o/add-rule!
+                (o/->rule ::generated
+                  {:what [['id ::color 'color]]
+                   :then (fn [session {:keys [color]}]
+                           (reset! *generated-fired true)
+                           (reset! *seen-color color))}))]}))
+        ;; insert color fact — it matches ::keeper so it stays in the session
+        (o/insert ::bob ::color "blue")
+        (o/insert ::trigger ::go? true)
+        o/fire-rules
+        ((fn [session]
+           ;; ::generated should have retroactively seen ::bob's color
+           (is @*generated-fired)
+           (is (= "blue" @*seen-color))
+           (is (= 1 (count (o/query-all session ::generated))))
+           session)))))
+
+(deftest retroactive-init-no-double-firing
+  ;; When retroactive init replays facts, the :then block should fire exactly once
+  (let [*fire-count (atom 0)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {::keeper
+             [:what
+              [id ::color color]]
+             ::trigger
+             [:what
+              [::trigger ::go? true]
+              :then
+              (o/add-rule!
+                (o/->rule ::counter
+                  {:what [['id ::color 'color]]
+                   :then (fn [session match]
+                           (swap! *fire-count inc))}))]}))
+        (o/insert ::alice ::color "red")
+        (o/insert ::bob ::color "blue")
+        (o/insert ::trigger ::go? true)
+        o/fire-rules
+        ((fn [session]
+           ;; should fire exactly twice (once per matching fact), not more
+           (is (= 2 @*fire-count))
+           session)))))
+
+(deftest add-rule!-throws-outside-rule
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (o/add-rule! (o/->rule ::foo {:what [['id ::color 'color]]})))))
+
+(deftest remove-rule!-throws-outside-rule
+  (is (thrown? #?(:clj Exception :cljs js/Error)
+               (o/remove-rule! ::foo))))
+
+;; === Phase 4: Truth maintenance ===
+
+(deftest removing-rule-cleans-up-meta-store
+  (let [rules (o/ruleset
+                {::rule1 [:what [id ::color color]]
+                 ::rule2 [:what [id ::height height]]})
+        session (reduce o/add-rule (o/->session) rules)]
+    ;; both rules have metadata
+    (is (o/query-all-meta session ::rule1))
+    (is (o/query-all-meta session ::rule2))
+    ;; remove rule1
+    (let [session (o/remove-rule session ::rule1)]
+      ;; rule1 metadata should be gone
+      (is (nil? (o/query-all-meta session ::rule1)))
+      ;; rule2 metadata should still be there
+      (is (o/query-all-meta session ::rule2)))))
+
+(deftest derived-rule-cascading-removal
+  ;; A rule created via add-rule! should be removed when its source rule is removed
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::source
+           [:what
+            [::trigger ::go? true]
+            :then
+            (o/add-rule!
+              (o/->rule ::derived
+                {:what [['id ::color 'color]]}))]}))
+      (o/insert ::trigger ::go? true)
+      o/fire-rules
+      ((fn [session]
+         ;; derived rule exists
+         (is (get-in session [:rule-name->node-id ::derived]))
+         session))
+      ;; remove the source rule — derived should cascade
+      (o/remove-rule ::source)
+      ((fn [session]
+         ;; derived should be gone too
+         (is (nil? (get-in session [:rule-name->node-id ::derived])))
+         ;; and its metadata
+         (is (nil? (o/query-all-meta session ::derived)))
+         session))))
+
+(deftest root-rule-survives-source-removal
+  ;; A rule created with {:root? true} should NOT be removed when its source is removed
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {::source
+           [:what
+            [::trigger ::go? true]
+            :then
+            (o/add-rule!
+              (o/->rule ::root-derived
+                {:what [['id ::color 'color]]})
+              {:root? true})]}))
+      (o/insert ::trigger ::go? true)
+      o/fire-rules
+      ((fn [session]
+         ;; root-derived rule exists
+         (is (get-in session [:rule-name->node-id ::root-derived]))
+         session))
+      ;; remove source rule
+      (o/remove-rule ::source)
+      ((fn [session]
+         ;; root-derived should SURVIVE
+         (is (get-in session [:rule-name->node-id ::root-derived]))
+         session))))
+
+(deftest deep-cascade-chain
+  ;; A -> B -> C: removing A should cascade to B and C
+  (-> (reduce o/add-rule (o/->session)
+        (o/ruleset
+          {;; keeper rules ensure facts survive in the session
+           ::keep-colors [:what [id ::color color]]
+           ::keep-heights [:what [id ::height height]]
+           ::rule-a
+           [:what
+            [::trigger ::go? true]
+            :then
+            (o/add-rule!
+              (o/->rule ::rule-b
+                {:what [['id ::color 'color]]
+                 :then (fn [session match]
+                         (o/add-rule!
+                           (o/->rule ::rule-c
+                             {:what [['id ::height 'height]]})))}))]}))
+      (o/insert ::bob ::color "blue")
+      (o/insert ::bob ::height 72)
+      (o/insert ::trigger ::go? true)
+      o/fire-rules
+      ((fn [session]
+         ;; all three should exist
+         (is (get-in session [:rule-name->node-id ::rule-a]))
+         (is (get-in session [:rule-name->node-id ::rule-b]))
+         (is (get-in session [:rule-name->node-id ::rule-c]))
+         session))
+      ;; remove A — B and C should cascade
+      (o/remove-rule ::rule-a)
+      ((fn [session]
+         (is (nil? (get-in session [:rule-name->node-id ::rule-b])))
+         (is (nil? (get-in session [:rule-name->node-id ::rule-c])))
+         session))))
+
+;; === Phase 5: Integration tests ===
+
+(deftest schema-driven-rule-generation
+  ;; From the SPEC example: a meta-rule that generates getter rules from schema declarations
+  (let [*getter-fired (atom false)
+        *getter-matches (atom nil)]
+    (-> (reduce o/add-rule (o/->session)
+          (o/ruleset
+            {;; meta-rule: when an entity schema is declared, generate a getter rule
+             ::schema->getter
+             [:what
+              [entity-kw ::schema-attributes attrs]
+              :then
+              (let [rule-name (keyword (namespace entity-kw) (str (name entity-kw) "-getter"))]
+                (o/add-rule!
+                  (o/->rule rule-name
+                    {:what (mapv (fn [attr] [(quote id) attr (symbol (name attr))]) attrs)
+                     :then (fn [session match]
+                             (reset! *getter-fired true)
+                             (reset! *getter-matches match))})))]}))
+        ;; insert some player data first (needs a keeper rule since no getter exists yet)
+        (o/add-rule (first (o/ruleset {::keep-x [:what [id ::x x]]})))
+        (o/add-rule (first (o/ruleset {::keep-y [:what [id ::y y]]})))
+        (o/add-rule (first (o/ruleset {::keep-health [:what [id ::health h]]})))
+        (o/insert ::player {::x 10 ::y 20 ::health 100})
+        ;; declare the schema — this triggers the meta-rule to generate the getter
+        (o/insert ::player ::schema-attributes [::x ::y ::health])
+        o/fire-rules
+        ((fn [session]
+           ;; the getter rule should have been created
+           (let [getter-name (keyword (namespace ::player) (str (name ::player) "-getter"))]
+             (is (get-in session [:rule-name->node-id getter-name]))
+             ;; and it should have fired with the pre-existing player data
+             (is @*getter-fired)
+             (is (= 10 (:x @*getter-matches)))
+             (is (= 20 (:y @*getter-matches)))
+             (is (= 100 (:health @*getter-matches))))
+           session)))))
+
+(deftest rule-analysis-detect-attribute-watchers
+  ;; Meta-rule that detects when multiple rules watch the same attribute
+  (let [*shared-attrs (atom #{})]
+    (-> (o/->session)
+        (o/add-rule (first (o/ruleset
+                             {::analyze-shared-attrs
+                              [:what
+                               [rule1 ::o/rule true]
+                               [rule1 ::o/conditions conditions1]
+                               [rule2 ::o/rule true]
+                               [rule2 ::o/conditions conditions2]
+                               :when
+                               (and (not= rule1 rule2)
+                                    ;; find attributes watched by both rules
+                                    (let [attrs1 (set (keep #(get-in % [:attr :value]) conditions1))
+                                          attrs2 (set (keep #(get-in % [:attr :value]) conditions2))
+                                          shared (clojure.set/intersection attrs1 attrs2)]
+                                      (seq shared)))
+                               :then
+                               (let [attrs1 (set (keep #(get-in % [:attr :value]) conditions1))
+                                     attrs2 (set (keep #(get-in % [:attr :value]) conditions2))]
+                                 (swap! *shared-attrs into (clojure.set/intersection attrs1 attrs2)))]})))
+        ;; add two rules that both watch ::color
+        (o/add-rule (first (o/ruleset {::rule1 [:what [id ::color color] [id ::height height]]})))
+        (o/add-rule (first (o/ruleset {::rule2 [:what [id ::color color] [id ::weight weight]]})))
+        ;; and one that doesn't
+        (o/add-rule (first (o/ruleset {::rule3 [:what [id ::age age]]})))
+        o/fire-rules
+        ((fn [session]
+           ;; should detect that ::color is watched by both rule1 and rule2
+           (is (contains? @*shared-attrs ::color))
+           ;; ::height, ::weight, ::age are not shared
+           (is (not (contains? @*shared-attrs ::height)))
+           (is (not (contains? @*shared-attrs ::weight)))
+           (is (not (contains? @*shared-attrs ::age)))
+           session)))))
+
+(deftest performance-100-rules
+  ;; Add 100+ rules and measure that metadata is correctly populated
+  (let [rules (mapv (fn [i]
+                      (o/->rule (keyword "perf-test" (str "rule-" i))
+                        {:what [['id (keyword "perf-test" (str "attr-" i)) 'v]]}))
+                    (range 100))
+        session (reduce o/add-rule (o/->session) rules)
+        all-meta (o/query-all-meta session)]
+    ;; all 100 rules should have metadata
+    (is (= 100 (count (:rule-meta-store session))))
+    ;; 6 meta-attrs per rule * 100 rules = 600 tuples
+    (is (= 600 (count all-meta)))
+    ;; spot-check a few rules
+    (let [meta-50 (o/query-all-meta session :perf-test/rule-50)]
+      (is (true? (::o/rule meta-50)))
+      (is (= 1 (count (::o/conditions-raw meta-50)))))))
 

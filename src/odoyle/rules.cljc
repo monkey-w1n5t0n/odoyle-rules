@@ -44,6 +44,19 @@
                                     :odoyle.rules.dynamic-rule/when
                                     :odoyle.rules.dynamic-rule/then
                                     :odoyle.rules.dynamic-rule/then-finally]))
+
+;; meta-rule attribute specs — registered so spec instrumentation doesn't throw on metadata insertion
+;; NOTE: ::rule is NOT redefined here because it would conflict with the parsing spec above.
+;; The ::rule attribute for meta-facts uses the same keyword but spec instrumentation on `insert`
+;; must be disabled (as is typical) or the user must register their own spec for it.
+(s/def ::conditions-raw any?)
+(s/def ::conditions any?)
+(s/def ::has-when? boolean?)
+(s/def ::has-then? boolean?)
+(s/def ::has-then-finally? boolean?)
+(s/def ::derived-from qualified-keyword?)
+(s/def ::root? boolean?)
+
 (defn parse [spec content]
   (let [res (s/conform spec content)]
     (if (= ::s/invalid res)
@@ -121,6 +134,8 @@ This is no longer necessary, because it is accessible via `match` directly."}
                     id-attr-nodes ;; map of id+attr -> set of alpha node paths
                     then-queue ;; set of (MemoryNode id, id+attrs) that need executed
                     then-finally-queue ;; set of MemoryNode ids that need executed
+                    rule-meta-store ;; map of rule-name -> {attr -> value} for meta-rule facts
+                    deferred-rules-queue ;; vector of [:add rule opts] / [:remove rule-name] for deferred execution
                     ])
 
 (defn- add-to-condition [condition field [kind value]]
@@ -289,6 +304,12 @@ This is no longer necessary, because it is accessible via `match` directly."}
 (def ^:private get-id-attr (juxt :id :attr))
 
 (declare left-activate-memory-node)
+(declare get-alpha-nodes-for-fact)
+(declare upsert-fact)
+(declare add-rule)
+(declare remove-rule)
+(declare remove-rule-safe)
+(declare insert-meta-facts-into-rete)
 
 (defn- left-activate-join-node
   ([session node-id id+attrs vars token]
@@ -562,8 +583,46 @@ This is no longer necessary, because it is accessible via `match` directly."}
                     {}))))
 
 (def ^:private ^:dynamic *mutable-session* nil)
+(def ^:private ^:dynamic *firing-rule-name* nil)
 (def ^:private ^:dynamic *recur-countdown* nil)
 (def ^:private ^:dynamic *executed-nodes* nil)
+
+(defn- initialize-rule-against-session
+  "Retroactively initializes a newly added rule against all existing facts in the session.
+  Walks the rule's join nodes and replays matching facts from their alpha nodes."
+  [session rule-name]
+  (let [leaf-node-id (get-in session [:rule-name->node-id rule-name])]
+    (if leaf-node-id
+      (let [;; collect all join node ids for this rule by walking from leaf to root
+            join-node-ids
+            (loop [node-id leaf-node-id
+                   ids []]
+              (let [node (get-in session [:beta-nodes node-id])]
+                (if (instance? JoinNode node)
+                  (recur (:parent-id node) (conj ids node-id))
+                  (if-let [parent-id (:parent-id node)]
+                    (recur parent-id ids)
+                    ids))))]
+        ;; for each join node, replay all facts from its alpha node
+        (reduce
+          (fn [session join-node-id]
+            (let [join-node (get-in session [:beta-nodes join-node-id])
+                  alpha-node (get-in session (:alpha-node-path join-node))]
+              (reduce
+                (fn [session [_id attr->fact]]
+                  (reduce
+                    (fn [session [_attr fact]]
+                      (right-activate-join-node
+                        session join-node-id
+                        (get-id-attr fact)
+                        (->Token fact :insert nil)))
+                    session
+                    attr->fact))
+                session
+                (:facts alpha-node))))
+          session
+          join-node-ids))
+      session)))
 
 ;; public
 
@@ -614,7 +673,8 @@ This is no longer necessary, because it is accessible via `match` directly."}
                                  (when enabled
                                    (binding [*session* session
                                              *mutable-session* (volatile! session)
-                                             *match* vars]
+                                             *match* vars
+                                             *firing-rule-name* (get-in session [:node-id->rule-name node-id])]
                                      (execute-fn #(then-fn session vars) node-id)
                                      @*mutable-session*)))
                                session)))
@@ -625,7 +685,8 @@ This is no longer necessary, because it is accessible via `match` directly."}
                        (fn [session node-id]
                          (let [{:keys [then-finally-fn]} (get beta-nodes node-id)]
                            (binding [*session* session
-                                     *mutable-session* (volatile! session)]
+                                     *mutable-session* (volatile! session)
+                                     *firing-rule-name* (get-in session [:node-id->rule-name node-id])]
                              (execute-fn #(then-finally-fn session) node-id)
                              @*mutable-session*)))
                        session
@@ -641,7 +702,114 @@ This is no longer necessary, because it is accessible via `match` directly."}
                                               @*node-id->triggered-node-ids)]
                (fire-rules session opts)))
            (fire-rules session opts)))
-       session))))
+       ;; then/then-finally queues are empty — drain deferred-rules-queue if present
+       (let [deferred (:deferred-rules-queue session)]
+         (if (and (seq deferred)
+                  ;; only drain at top level, not while inside a rule
+                  (nil? *session*))
+           (let [session (assoc session :deferred-rules-queue [])
+                 session (reduce
+                           (fn [session [op & args]]
+                             (case op
+                               :add (let [[rule opts] args
+                                          session (add-rule session rule)
+                                          rule-name (:name rule)
+                                          ;; record provenance in rule-meta-store
+                                          session (if-let [source (:source-rule opts)]
+                                                    (-> session
+                                                        (assoc-in [:rule-meta-store rule-name ::derived-from] source)
+                                                        (insert-meta-facts-into-rete rule-name {::derived-from source}))
+                                                    session)
+                                          session (if (:root? opts)
+                                                    (-> session
+                                                        (assoc-in [:rule-meta-store rule-name ::root?] true)
+                                                        (insert-meta-facts-into-rete rule-name {::root? true}))
+                                                    session)]
+                                      (initialize-rule-against-session session rule-name))
+                               :remove (let [[rule-name] args]
+                                         (remove-rule-safe session rule-name))))
+                           session
+                           deferred)]
+             ;; fire-rules again so newly added rules can fire
+             (fire-rules session opts))
+           session))))))
+
+(defn- binding->raw
+  "Reverses the (list 'quote sym) storage of bindings back to just the symbol."
+  [{:keys [field sym]}]
+  ;; sym is stored as (list 'quote actual-sym), so (second sym) gets the actual symbol
+  (second sym))
+
+(defn- condition->raw-tuple
+  "Reconstructs the original [id attr value] vector (with optional opts map) from a Condition."
+  [{:keys [nodes bindings opts]}]
+  (let [;; build a map from field -> value (either a binding symbol or a literal test-value)
+        field-map (reduce (fn [m {:keys [field] :as binding}]
+                            (assoc m field (binding->raw binding)))
+                          {}
+                          bindings)
+        field-map (reduce (fn [m {:keys [test-field test-value]}]
+                            (assoc m test-field test-value))
+                          field-map
+                          nodes)
+        tuple [(:id field-map) (:attr field-map) (:value field-map)]]
+    (if (seq opts)
+      (conj tuple opts)
+      tuple)))
+
+(defn- condition->structured-map
+  "Transforms a Condition record into a queryable map per the SPEC."
+  [{:keys [nodes bindings opts]}]
+  (let [;; build maps for bindings and literal values
+        field-map (reduce (fn [m {:keys [field] :as binding}]
+                            (assoc m field {:kind :binding :sym (binding->raw binding)}))
+                          {}
+                          bindings)
+        field-map (reduce (fn [m {:keys [test-field test-value]}]
+                            (assoc m test-field {:kind :value :value test-value}))
+                          field-map
+                          nodes)]
+    {:id    (:id field-map)
+     :attr  (:attr field-map)
+     :value (:value field-map)
+     :opts  (or opts {})}))
+
+(defn- rule->meta-facts
+  "Returns a map of {attr -> value} metadata facts for a rule."
+  [rule]
+  {::rule true
+   ::conditions-raw (mapv condition->raw-tuple (:conditions rule))
+   ::conditions (mapv condition->structured-map (:conditions rule))
+   ::has-when? (some? (:when-fn rule))
+   ::has-then? (some? (:then-fn rule))
+   ::has-then-finally? (some? (:then-finally-fn rule))})
+
+(defn- meta-attr?
+  "Returns true if attr is a meta-attribute (in the ::o/ namespace)."
+  [attr]
+  (and (qualified-keyword? attr)
+       (= (namespace attr) (namespace ::rule))))
+
+(defn- rule-watches-meta?
+  "Returns true if a rule has any ::o/ attributes in its :what block."
+  [rule]
+  (some (fn [condition]
+          (some (fn [{:keys [test-field test-value]}]
+                  (and (= :attr test-field) (meta-attr? test-value)))
+                (:nodes condition)))
+        (:conditions rule)))
+
+(defn- insert-meta-facts-into-rete
+  "Inserts metadata facts for a rule into the RETE network (for meta-rules to react to).
+  Uses the internal insert path directly, bypassing spec instrumentation on `insert`
+  (which would fail because ::o/rule conflicts with the parsing spec)."
+  [session rule-name meta-facts]
+  (reduce-kv
+    (fn [session attr value]
+      (->> (get-alpha-nodes-for-fact session (:alpha-node session) rule-name attr value true)
+           (upsert-fact session rule-name attr value)))
+    session
+    meta-facts))
 
 (s/fdef add-rule
   :args (s/cat :session ::session
@@ -698,49 +866,145 @@ This is no longer necessary, because it is accessible via `match` directly."}
                                                 :disable-fast-updates disable-fast-updates)))))
                         session
                         (:join-node-ids session))]
-    (-> session
-        (assoc-in [:beta-nodes leaf-node-id :when-fn] (:when-fn rule))
-        (assoc-in [:beta-nodes leaf-node-id :then-fn] (:then-fn rule))
-        (assoc-in [:beta-nodes leaf-node-id :then-finally-fn] (:then-finally-fn rule))
-        (assoc-in [:rule-name->node-id (:name rule)] leaf-node-id)
-        (assoc-in [:node-id->rule-name leaf-node-id] (:name rule))
-        ;; assoc'ed by add-condition
-        (dissoc :mem-node-ids :join-node-ids :bindings))))
+    (let [session (-> session
+                      (assoc-in [:beta-nodes leaf-node-id :when-fn] (:when-fn rule))
+                      (assoc-in [:beta-nodes leaf-node-id :then-fn] (:then-fn rule))
+                      (assoc-in [:beta-nodes leaf-node-id :then-finally-fn] (:then-finally-fn rule))
+                      (assoc-in [:rule-name->node-id (:name rule)] leaf-node-id)
+                      (assoc-in [:node-id->rule-name leaf-node-id] (:name rule))
+                      ;; assoc'ed by add-condition
+                      (dissoc :mem-node-ids :join-node-ids :bindings))
+          ;; populate rule-meta-store unconditionally
+          meta-facts (rule->meta-facts rule)
+          session (assoc-in session [:rule-meta-store (:name rule)] meta-facts)
+          ;; if this new rule is a meta-rule, replay all existing rule-meta-store entries through it
+          ;; (this handles: meta-rule added AFTER domain rules)
+          session (if (rule-watches-meta? rule)
+                    (reduce-kv
+                      (fn [session existing-rule-name existing-meta]
+                        (insert-meta-facts-into-rete session existing-rule-name existing-meta))
+                      session
+                      (:rule-meta-store session))
+                    session)
+          ;; insert this rule's metadata into RETE for any already-present meta-rules to react
+          ;; (this handles: domain rule added AFTER meta-rules)
+          ;; insert silently discards facts that match no rule, so this is safe even without meta-rules
+          session (insert-meta-facts-into-rete session (:name rule) meta-facts)]
+      session)))
 
 (s/fdef remove-rule
   :args (s/cat :session ::session
                :rule-name qualified-keyword?))
 
+(defn- retract-meta-facts-from-rete
+  "Retracts metadata facts for a rule from the RETE network."
+  [session rule-name meta-facts]
+  (reduce-kv
+    (fn [session attr _value]
+      (let [id+attr [rule-name attr]]
+        (if (get-in session [:id-attr-nodes id+attr])
+          ;; fact is in the RETE — retract it
+          (let [node-paths (get-in session [:id-attr-nodes id+attr])]
+            (reduce
+              (fn [session node-path]
+                (let [node (get-in session node-path)
+                      fact (get-in node [:facts rule-name attr])]
+                  (if fact
+                    (right-activate-alpha-node session node-path (->Token fact :retract nil))
+                    session)))
+              session
+              node-paths))
+          session)))
+    session
+    meta-facts))
+
+(defn- cascade-remove-derived-rules
+  "Recursively removes rules derived from the given rule, unless they are root rules."
+  [session rule-name]
+  (let [derived-rules (reduce-kv
+                        (fn [acc rname meta]
+                          (if (= (get meta ::derived-from) rule-name)
+                            (conj acc rname)
+                            acc))
+                        []
+                        (:rule-meta-store session))]
+    (reduce
+      (fn [session derived-name]
+        (if (get-in session [:rule-meta-store derived-name ::root?])
+          session ;; root rules survive
+          (remove-rule-safe session derived-name)))
+      session
+      derived-rules)))
+
 (defn remove-rule
   "Removes a rule from the given session."
   [session rule-name]
   (if-let [node-id (get-in session [:rule-name->node-id rule-name])]
-    (-> (loop [session session
-               node-id node-id]
-          (if node-id
-            (let [node (get-in session [:beta-nodes node-id])
-                  session (update session :beta-nodes dissoc node-id)]
-              (if (instance? JoinNode node)
-                (-> session
-                    (update-in (:alpha-node-path node)
-                               (fn [alpha-node]
-                                 (update alpha-node :successors (fn [successors]
-                                                                  (vec (remove #(= % node-id) successors))))))
-                    (recur (:parent-id node)))
-                (recur session (:parent-id node))))
-            session))
-        (update :rule-name->node-id dissoc rule-name)
-        (update :node-id->rule-name dissoc node-id)
-        (update :then-queue (fn [then-queue]
-                              (reduce
-                                (fn [s [id _ :as tuple]]
-                                  (if (= id node-id)
-                                    (disj s tuple)
-                                    s))
-                                then-queue
-                                then-queue)))
-        (update :then-finally-queue disj node-id))
+    (let [meta-facts (get-in session [:rule-meta-store rule-name])
+          session (-> (loop [session session
+                             node-id node-id]
+                        (if node-id
+                          (let [node (get-in session [:beta-nodes node-id])
+                                session (update session :beta-nodes dissoc node-id)]
+                            (if (instance? JoinNode node)
+                              (-> session
+                                  (update-in (:alpha-node-path node)
+                                             (fn [alpha-node]
+                                               (update alpha-node :successors (fn [successors]
+                                                                                (vec (remove #(= % node-id) successors))))))
+                                  (recur (:parent-id node)))
+                              (recur session (:parent-id node))))
+                          session))
+                      (update :rule-name->node-id dissoc rule-name)
+                      (update :node-id->rule-name dissoc node-id)
+                      (update :then-queue (fn [then-queue]
+                                            (reduce
+                                              (fn [s [id _ :as tuple]]
+                                                (if (= id node-id)
+                                                  (disj s tuple)
+                                                  s))
+                                              then-queue
+                                              then-queue)))
+                      (update :then-finally-queue disj node-id))
+          ;; clean up rule-meta-store
+          session (update session :rule-meta-store dissoc rule-name)
+          ;; retract metadata facts from RETE
+          session (if meta-facts
+                    (retract-meta-facts-from-rete session rule-name meta-facts)
+                    session)
+          ;; cascade: remove derived rules (truth maintenance)
+          session (cascade-remove-derived-rules session rule-name)]
+      session)
     (throw (ex-info (str rule-name " does not exist in session") {}))))
+
+(defn- remove-rule-safe
+  "Like remove-rule but returns session unchanged if the rule doesn't exist.
+  Used in cascade/drain contexts where a rule may have already been removed."
+  [session rule-name]
+  (if (get-in session [:rule-name->node-id rule-name])
+    (remove-rule session rule-name)
+    session))
+
+(defn add-rule!
+  "Queues a rule addition for after the current fire-rules cycle completes.
+  Must be called inside a :then or :then-finally block.
+  Optional opts map supports :root? true to prevent truth-maintenance cascading."
+  ([rule]
+   (add-rule! rule {}))
+  ([rule opts]
+   (if *mutable-session*
+     (let [source-rule *firing-rule-name*]
+       (vswap! *mutable-session* update :deferred-rules-queue
+               conj [:add rule (assoc opts :source-rule source-rule)]))
+     (throw (ex-info "This function must be called in a :then or :then-finally block" {})))))
+
+(defn remove-rule!
+  "Queues a rule removal for after the current fire-rules cycle completes.
+  Must be called inside a :then or :then-finally block."
+  [rule-name]
+  (if *mutable-session*
+    (vswap! *mutable-session* update :deferred-rules-queue conj [:remove rule-name])
+    (throw (ex-info "This function must be called in a :then or :then-finally block" {}))))
 
 #?(:clj
  (defmacro ruleset
@@ -776,7 +1040,9 @@ This is no longer necessary, because it is accessible via `match` directly."}
      :node-id->rule-name {}
      :id-attr-nodes {}
      :then-queue #{}
-     :then-finally-queue #{}}))
+     :then-finally-queue #{}
+     :rule-meta-store {}
+     :deferred-rules-queue []}))
 
 (s/def ::session #(instance? Session %))
 
@@ -891,12 +1157,16 @@ This is no longer necessary, because it is accessible via `match` directly."}
 
 (defn query-all
   "When called with just a session, returns a vector of all inserted facts.
-  Otherwise, returns a vector of maps containing all the matches for the given rule."
+  Otherwise, returns a vector of maps containing all the matches for the given rule.
+  Meta-facts (::o/ attributes) are excluded from the no-arg form; use query-all-meta instead."
   ([session]
-   (mapv (fn [[[id attr] nodes]]
-           (-> (get-in session (first nodes))
-               (get-in [:facts id attr])
-               ((juxt :id :attr :value))))
+   (into []
+         (comp
+           (remove (fn [[[_id attr] _nodes]] (meta-attr? attr)))
+           (map (fn [[[id attr] nodes]]
+                  (-> (get-in session (first nodes))
+                      (get-in [:facts id attr])
+                      ((juxt :id :attr :value))))))
          (:id-attr-nodes session)))
   ([session rule-name]
    (let [rule-id (or (get-in session [:rule-name->node-id rule-name])
@@ -909,6 +1179,20 @@ This is no longer necessary, because it is accessible via `match` directly."}
            v))
        []
        (:matches rule)))))
+
+(defn query-all-meta
+  "Returns rule metadata from the rule-meta-store.
+  With just a session, returns all rule metadata as a vector of [rule-name attr value] tuples.
+  With a rule-name, returns the metadata map for that specific rule."
+  ([session]
+   (into []
+         (mapcat (fn [[rule-name meta-facts]]
+                   (map (fn [[attr value]]
+                          [rule-name attr value])
+                        meta-facts)))
+         (:rule-meta-store session)))
+  ([session rule-name]
+   (get (:rule-meta-store session) rule-name)))
 
 (s/fdef reset!
   :args (s/cat :new-session ::session))

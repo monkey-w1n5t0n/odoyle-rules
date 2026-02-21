@@ -712,20 +712,22 @@ This is no longer necessary, because it is accessible via `match` directly."}
                            (fn [session [op & args]]
                              (case op
                                :add (let [[rule opts] args
-                                          session (add-rule session rule)
-                                          rule-name (:name rule)
-                                          ;; record provenance in rule-meta-store
-                                          session (if-let [source (:source-rule opts)]
-                                                    (-> session
-                                                        (assoc-in [:rule-meta-store rule-name ::derived-from] source)
-                                                        (insert-meta-facts-into-rete rule-name {::derived-from source}))
-                                                    session)
-                                          session (if (:root? opts)
-                                                    (-> session
-                                                        (assoc-in [:rule-meta-store rule-name ::root?] true)
-                                                        (insert-meta-facts-into-rete rule-name {::root? true}))
-                                                    session)]
-                                      (initialize-rule-against-session session rule-name))
+                                          rule-name (:name rule)]
+                                      (if (get-in session [:rule-name->node-id rule-name])
+                                        session ;; rule already exists, skip (idempotent)
+                                        (let [session (add-rule session rule)
+                                              ;; record provenance in rule-meta-store
+                                              session (if-let [source (:source-rule opts)]
+                                                        (-> session
+                                                            (assoc-in [:rule-meta-store rule-name ::derived-from] source)
+                                                            (insert-meta-facts-into-rete rule-name {::derived-from source}))
+                                                        session)
+                                              session (if (:root? opts)
+                                                        (-> session
+                                                            (assoc-in [:rule-meta-store rule-name ::root?] true)
+                                                            (insert-meta-facts-into-rete rule-name {::root? true}))
+                                                        session)]
+                                          (initialize-rule-against-session session rule-name))))
                                :remove (let [[rule-name] args]
                                          (remove-rule-safe session rule-name))))
                            session
@@ -1213,6 +1215,11 @@ This is no longer necessary, because it is accessible via `match` directly."}
   "Returns true if the session contains a fact with the given id and attribute."
   [session id attr]
   (clojure.core/contains? (:id-attr-nodes session) [id attr]))
+
+(defn contains-rule?
+  "Returns true if the session contains a rule with the given name."
+  [session rule-name]
+  (clojure.core/contains? (:rule-name->node-id session) rule-name))
 
 (s/fdef wrap-rule
   :args (s/cat :rule #(instance? Rule %)

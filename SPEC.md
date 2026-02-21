@@ -219,6 +219,53 @@ rule-generation loops.
 
 ---
 
+## Keeper Rules
+
+O'Doyle silently discards any fact that matches no rule at `insert` time. This is
+intentional engine behaviour, but it has a critical interaction with `add-rule!`: rules
+added via `add-rule!` are deferred until after the current `fire-rules` cycle completes.
+Domain facts inserted *before* `fire-rules` — or during earlier cycles — will already have
+been discarded if nothing else was watching their attributes.
+
+Retroactive initialization (Phase 3) replays facts that are *already in the RETE network*.
+It cannot recover facts that were never stored.
+
+### The pattern
+
+A **keeper rule** is a minimal rule with only a `:what` block that matches the attributes
+your generated rules will need. It has no `:then` or `:when` — its sole purpose is to
+ensure facts are retained in the RETE network until generated rules arrive.
+
+```clojure
+;; WITHOUT keeper — :player/x facts are silently discarded before
+;; the generated getter rule arrives:
+(-> session
+    (o/insert ::player :player/x 10)    ;; LOST — no rule watches :player/x yet
+    o/fire-rules)                        ;; meta-rule generates getter, but too late
+
+;; WITH keeper — facts survive until the generated rule arrives:
+::keep-player-x
+[:what [id :player/x val]]              ;; minimal — retains :player/x facts
+
+(-> session
+    (o/insert ::player :player/x 10)    ;; retained by ::keep-player-x
+    o/fire-rules)                        ;; generated getter sees the fact via retroactive init
+```
+
+### When keepers are NOT needed
+
+If a rule is added via `add-rule` (the synchronous, non-deferred version) *before* facts
+are inserted, no keeper is needed — the rule is already wired into the RETE network at
+insert time. Keepers are specifically required for the `add-rule!` deferred path, where
+domain facts may predate the generated rule.
+
+### Naming convention
+
+The examples in `test/odoyle/examples/` use `::keep-<attribute>` as a naming convention
+for keeper rules (e.g., `::keep-player-x`, `::keep-health`).
+
+---
+
 ## Truth Maintenance & Provenance
 
 The "source rule" for provenance purposes is **the rule whose `:then` or `:then-finally`

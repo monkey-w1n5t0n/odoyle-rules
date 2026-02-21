@@ -813,6 +813,21 @@
         (is (thrown? #?(:clj Exception :cljs js/Error)
                      (o/fire-rules session)))))))
 
+(deftest infinite-self-triggering-caught-by-recursion-limit
+  ;; A rule that inserts a fact causing itself to re-fire indefinitely
+  ;; should be caught by the recursion limit, not hang forever.
+  (let [session (-> (reduce o/add-rule (o/->session)
+                      (o/ruleset
+                        {::self-trigger
+                         [:what
+                          [::counter ::value n]
+                          :then
+                          (o/insert! ::counter ::value (inc n))]}))
+                    (o/insert ::counter ::value 0))]
+    (is (thrown-with-msg? #?(:clj Exception :cljs js/Error)
+                          #"Recursion limit hit"
+                          (o/fire-rules session)))))
+
 (deftest non-deterministic-behavior
   (let [*count (atom 0)]
     (-> (reduce o/add-rule (o/->session)

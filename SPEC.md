@@ -32,7 +32,6 @@ into the session. This allows writing rules whose `:what` blocks match on other 
 
 - Cross-session joins (meta-facts always live in the same session as domain facts)
 - Automatic cycle detection for meta-rule chains (the existing recursion limit covers this)
-- Rule ordering guarantees for deferred rules (order is implementation-defined)
 - Full ClojureScript parity before the research phase concludes
 
 ---
@@ -46,8 +45,21 @@ into the session. This allows writing rules whose `:what` blocks match on other 
 ;; => session with rule added AND rule-metadata facts inserted
 ```
 
-After wiring the RETE network (as today), `add-rule` inserts EAV facts describing the rule
-into the session. These facts are tagged as `:meta? true` internally.
+After wiring the RETE network (as today), `add-rule`:
+
+1. Unconditionally stores rule metadata in a new `rule-meta-store` field on Session (a plain
+   map, bypassing the RETE network). This ensures metadata survives even if no meta-rule
+   has been added yet.
+2. If the newly added rule watches `::o/rule`, `::o/conditions`, or other `::o/` attributes
+   in its `:what` block, it is retroactively initialized against all entries in
+   `rule-meta-store` (i.e., all previously added rules' metadata is replayed through it).
+3. Inserts EAV facts into the RETE network for any already-present meta-rules to react to.
+
+**Why `rule-meta-store` is necessary**: O'Doyle discards facts that match no rule at
+insertion time (documented behaviour). If a user calls `(reduce o/add-rule session [domain-rule meta-rule])`,
+the metadata facts for `domain-rule` would be inserted before `meta-rule` exists, and
+silently dropped. `rule-meta-store` is the source of truth; the RETE network is a secondary
+index populated on-demand.
 
 **No behaviour change for callers** — the return type is still a `Session`.
 
@@ -100,19 +112,22 @@ Deferred version of `remove-rule` for use inside rule bodies.
 
 ---
 
-### 5. `query-all` (existing, modified)
+### 5. `query-all` (existing, unchanged) and `query-all-meta` (new)
 
 ```clojure
-;; Default — rule-metadata facts excluded:
+;; Unchanged — returns domain facts only (safe for serialization):
 (o/query-all session)
+(o/query-all session ::my-rule)
 
-;; Opt-in to include rule-metadata facts:
-(o/query-all session {:include-meta? true})
+;; New — returns all rule-metadata facts from rule-meta-store:
+(o/query-all-meta session)
+(o/query-all-meta session ::my-rule)  ;; metadata facts for a specific rule
 ```
 
-The no-arg arity now accepts an optional options map. By default, facts tagged as
-`:meta? true` are excluded (safe for serialization). Passing `{:include-meta? true}`
-includes them.
+`query-all` is **not modified** — adding an opts map would create an ambiguous 2-arg arity
+collision with `(query-all session rule-name)` (both take session + one argument; the only
+difference would be type). Instead, `query-all-meta` is a new function for explicit
+metadata access.
 
 ---
 
@@ -124,7 +139,6 @@ When rule `::my-ns/my-rule` is added, the following facts are inserted:
 id                   attr                              value
 ──────────────────────────────────────────────────────────────────────
 ::my-ns/my-rule      ::o/rule                          true
-::my-ns/my-rule      ::o/rule-name                     ::my-ns/my-rule
 ::my-ns/my-rule      ::o/conditions-raw                [[id ::x x] [id ::y y]]
 ::my-ns/my-rule      ::o/conditions                    [{:id   {:kind :binding :sym id}
                                                           :attr  {:kind :value   :value ::x}
@@ -137,12 +151,15 @@ id                   attr                              value
 ```
 
 **Notes:**
-- `::o/conditions-raw` stores the raw quoted what-tuples as a vector. Not EDN-safe by
-  default (contains symbols), but useful for source-level introspection.
+- `::o/rule-name` was considered but dropped — it's redundant. Any meta-rule matching
+  `[rule-name ::o/rule true]` already has the rule name in the `rule-name` binding.
+- `::o/conditions-raw` stores the raw what-tuples with binding symbols. Not EDN-safe
+  (contains symbols), but useful for source-level introspection.
 - `::o/conditions` stores the structured, serialization-friendly form: each element is a
   map with `:id`, `:attr`, `:value` keys, each being `{:kind :binding/:value, :sym/:value ...}`.
-- The id column uses the rule keyword itself — this means meta-rules can use joins on
-  the rule name across multiple attributes.
+- The id column uses the rule keyword itself — meta-rules can join across attributes.
+- All `::o/` attributes are spec-registered by the library at load time. If spec is
+  instrumented, `insert` will not throw on metadata attribute insertion.
 
 ---
 
@@ -179,21 +196,34 @@ During `fire-rules`, rule bodies may call `add-rule!` and `remove-rule!`.
 These are queued in a *deferred-rules-queue* on the mutable session volatile.
 
 After the current `fire-rules` cycle completes (all `:then` and `:then-finally` blocks
-executed), the engine:
+executed), the engine drains the deferred queue in **FIFO interleaved order** (the order
+calls were made, not grouped by type):
 
-1. Applies all deferred `add-rule` calls (in queue order), inserting RETE nodes.
-2. For each newly added rule, replays all existing facts through its alpha/beta network
-   (retroactive initialization), populating `matches` and queuing `:then` firings.
-3. Applies all deferred `remove-rule` calls, including cascading derived-rule removal.
-4. Calls `fire-rules` again on the resulting session.
-5. Repeats until the deferred queue is empty.
+1. For each queued operation in order:
+   - `add-rule`: wire RETE nodes, then retroactively initialize against existing facts.
+   - `remove-rule`: remove RETE nodes, cascade to derived rules (skip if already removed).
+2. Call `fire-rules` again on the resulting session.
+3. Repeat until the deferred queue is empty.
 
-The existing recursion limit applies across this entire process to prevent infinite
+**Ordering note**: FIFO interleaved means if a `:then` block calls `add-rule! ::foo` then
+`remove-rule! ::foo`, `::foo` is added and then immediately removed (net result: not added).
+Grouping all adds before removes could produce different results and is harder to reason
+about. FIFO is more predictable.
+
+**`remove-rule` and missing rules**: Cascading removal may attempt to remove a rule that
+was already manually removed. `remove-rule` must handle this gracefully (log and skip
+rather than throw) when called from within a cascade or drain context.
+
+The existing recursion limit applies across the entire drain process to prevent infinite
 rule-generation loops.
 
 ---
 
 ## Truth Maintenance & Provenance
+
+The "source rule" for provenance purposes is **the rule whose `:then` or `:then-finally`
+block called `add-rule!`**, period. It is always the directly enclosing rule, regardless
+of join complexity or how many rules contributed to triggering the match.
 
 Each deferred `add-rule!` call implicitly records provenance:
 
@@ -215,57 +245,82 @@ metadata fact, which `remove-rule` checks before cascading.
 
 ## Serialization
 
-`query-all` without args excludes facts where the internal `:meta?` flag is true.
+`query-all` is unchanged — it returns only domain facts (as today). Rule-metadata facts
+live in `rule-meta-store` and are not part of `query-all`'s output.
 
-For users who want to inspect or store rule-metadata:
-
+To inspect or dump rule metadata:
 ```clojure
-;; include meta facts
-(o/query-all session {:include-meta? true})
+(o/query-all-meta session)           ;; all rule metadata facts
+(o/query-all-meta session ::my-rule) ;; metadata for one rule
 ```
 
 When loading serialized domain facts back into a fresh session, the standard workflow
-(re-add rules, then re-insert domain facts) remains unchanged. Rule-metadata facts are
-re-inserted automatically by `add-rule`.
+(re-add rules, then re-insert domain facts) remains unchanged. Rule-metadata is
+re-populated automatically by `add-rule`.
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: Rule-metadata insertion in `add-rule`
+### Phase 1: `rule-meta-store` + metadata insertion in `add-rule`
 
-- Modify `add-rule` to call `insert` for each metadata fact after building the RETE network.
-- Tag inserted facts with `:meta? true` in a new `meta-fact-ids` set on `Session`.
-- Modify `query-all` no-arg arity to accept opts and filter out meta facts by default.
-- Write tests: adding a rule causes queryable rule-facts; query-all excludes them by default.
+- Add `rule-meta-store` field to the `Session` record: `{rule-name -> {attr -> value}}`.
+- Implement the structured condition map builder (`condition->structured-map`).
+- After RETE wiring in `add-rule`, populate `rule-meta-store` with all metadata for the rule:
+  `::o/rule`, `::o/conditions-raw`, `::o/conditions` (structured), `::o/has-when?`,
+  `::o/has-then?`, `::o/has-then-finally?`.
+- Register clojure.spec specs for all `::o/` attributes at library load time (required
+  so spec instrumentation doesn't throw when metadata is inserted into the RETE).
+- If the newly added rule has `::o/rule` etc. in its `:what` block (it is a meta-rule),
+  replay all `rule-meta-store` entries through it (retroactive initialization for `add-rule`).
+- Also call `insert` for metadata facts into the RETE for any already-present meta-rules.
+- Add `query-all-meta` function.
+- Write tests:
+  - Adding rules in any order: meta-rule added last still sees all prior rules' metadata.
+  - Adding meta-rule first also works.
+  - `query-all` is unchanged; `query-all-meta` returns metadata.
+  - Spec instrumentation does not throw on metadata insertion.
 
 ### Phase 2: `add-rule!` and deferred queue
 
-- Add `deferred-rules-queue` field to `Session`.
+- Add `deferred-rules-queue` field to `Session` (vector of `[:add rule opts]` / `[:remove rule-name]`).
 - Implement `add-rule!` using `*mutable-session*` volatile (mirrors `insert!`).
-- After `fire-rules` main loop, drain the deferred queue.
-- Write tests: calling `add-rule!` in a `:then` block produces a working rule after firing.
+- Implement `remove-rule!` (deferred version of `remove-rule`).
+- After `fire-rules` main loop, drain the deferred queue in FIFO order.
+- `remove-rule` in cascade context must skip-not-throw if a rule no longer exists.
+- Write tests:
+  - `add-rule!` in `:then` block produces a working rule after firing.
+  - `remove-rule!` in `:then` block removes rule after firing.
+  - Interleaved add/remove of same rule in one cycle: net result is removed.
+  - `remove-rule` cascade doesn't throw on already-removed derived rules.
 
 ### Phase 3: Retroactive initialization
 
-- Implement `initialize-rule-against-session` that replays all existing facts through a
-  freshly added rule's alpha/beta nodes.
-- Integrate into the deferred queue drain step.
-- Write tests: meta-rule creates a getter rule; the getter rule's matches are populated
-  with pre-existing facts without re-inserting them.
+- Implement `initialize-rule-against-session` that replays all existing session facts
+  (from `id-attr-nodes`) through a freshly added rule's alpha/beta nodes.
+- Integrate into the deferred queue drain step (for `add-rule!` path) AND into regular
+  `add-rule` (for meta-rules catching up on prior rule metadata).
+- Write tests:
+  - Meta-rule creates a getter rule; getter rule immediately has matches for pre-existing facts.
+  - No double-firing when a fact is both pre-existing and matches the new rule.
 
 ### Phase 4: `remove-rule!` and truth maintenance
 
-- Implement `remove-rule!` (deferred version).
-- Extend `remove-rule` to retract rule-metadata facts.
-- Implement derived-rule cascading on remove.
-- Write tests: removing a rule cascades; root rules survive.
+- Extend `remove-rule` to remove the rule's entry from `rule-meta-store`.
+- Implement derived-rule cascading: on remove, find all rules with `::o/derived-from =
+  rule-name` in `rule-meta-store`; remove each unless `::o/root? true`; recurse.
+- Write tests:
+  - Removing a rule cascades to derived rules.
+  - `{:root? true}` rules survive source rule removal.
+  - Deep cascade chains work.
 
-### Phase 5: Structured condition maps
+### Phase 5: Integration tests and prototype evaluation
 
-- Implement the structured condition map builder.
-- Insert `::o/conditions` (structured) and `::o/conditions-raw` (raw) on `add-rule`.
-- Write tests: meta-rules can filter on specific watched attributes via `:when`.
+- Schema-driven rule generation example (from spec below) as a runnable test.
+- Plugin/extension system: insert rule-spec facts → meta-rule materializes them as rules.
+- Rule analysis: meta-rule detects two rules watching the same attribute.
+- Performance: add 100+ rules at startup, measure `rule-meta-store` + RETE overhead.
+- Document findings in SPEC.md under a new 'Prototype Results' section.
 
 ---
 
@@ -275,25 +330,24 @@ re-inserted automatically by `add-rule`.
    `*mutable-session*` volatile used by `insert!`. ClojureScript should work the same,
    but needs explicit testing.
 
-2. **Ordering of deferred rules**: If multiple `add-rule!` calls happen in the same
-   fire-rules cycle, what order are they applied? FIFO queue seems natural. Does order
-   matter for correctness?
-
-3. **Recursion limit interaction**: The deferred-drain loop runs `fire-rules` again.
+2. **Recursion limit interaction**: The deferred-drain loop runs `fire-rules` again.
    Does each drain iteration count against the recursion limit, or does it reset?
-   Current thinking: it resets (it's a new top-level fire-rules call).
+   Current thinking: it resets (it's a new top-level fire-rules call, not a recursive
+   trigger from within `fire-rules`).
 
-4. **`ruleset` macro and metadata**: The `ruleset` macro calls `->rule` then the user
-   calls `add-rule`. Since `add-rule` inserts metadata, the macro path is automatically
-   covered. No macro changes needed.
+3. **Performance**: Every `add-rule` call now populates `rule-meta-store` and inserts
+   ~6 facts into the RETE (if meta-rules exist). For sessions with many rules added at
+   startup, profile the overhead. Consider lazy metadata insertion (only insert into RETE
+   when a meta-rule is actually present).
 
-5. **Spec integration for meta-attributes**: Should `::o/rule`, `::o/conditions`, etc.
-   have registered specs? If spec is instrumented, inserting without specs would throw.
-   Probably yes — register them in the library namespace.
+4. **`wrap-rule` interaction**: `wrap-rule` modifies a rule's fns before `add-rule` is
+   called. Should `::o/has-then?` reflect the original rule structure or the wrapped one?
+   Decision needed: almost certainly the original (structural metadata, not runtime fns).
 
-6. **Performance**: Every `add-rule` call will now trigger `insert` for ~7 facts. For
-   sessions with hundreds of rules added at startup, this adds overhead. Profile and
-   consider batching inserts.
+5. **`conditions-raw` reconstruction**: The parsed `Condition` records store bindings as
+   `(list 'quote sym)` internally. Reconstructing the original `[id attr value]` tuples
+   for `::o/conditions-raw` requires a `condition->raw-tuple` fn that reverses this.
+   Verify this round-trips correctly for all binding/value combinations including opts.
 
 ---
 

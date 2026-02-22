@@ -680,6 +680,54 @@ This is no longer necessary, because it is accessible via `match` directly."}
   [attr-index attr]
   (get attr-index attr #{}))
 
+(defn- store-insert-into-session
+  [session id attr val]
+  (let [[fact-store attr-index] (store-insert (:fact-store session) (:attr-index session) id attr val)]
+    (assoc session :fact-store fact-store :attr-index attr-index)))
+
+(defn- store-retract-into-session
+  [session id attr]
+  (let [[fact-store attr-index] (store-retract (:fact-store session) (:attr-index session) id attr)]
+    (assoc session :fact-store fact-store :attr-index attr-index)))
+
+(defn- insert-meta-facts-into-store
+  [session rule-name meta-facts]
+  (reduce-kv
+    (fn [session attr value]
+      (store-insert-into-session session rule-name attr value))
+    session
+    meta-facts))
+
+(defn- retract-meta-facts-from-store
+  [session rule-name meta-facts]
+  (reduce-kv
+    (fn [session attr _value]
+      (store-retract-into-session session rule-name attr))
+    session
+    meta-facts))
+
+(defn- store-live-meta-facts-for-rule
+  [fact-store rule-name]
+  (let [meta-facts (reduce-kv
+                     (fn [m attr entry]
+                       (if (and (:alive? entry) (meta-attr? attr))
+                         (assoc m attr (:current entry))
+                         m))
+                     {}
+                     (get fact-store rule-name {}))]
+    (when (seq meta-facts)
+      meta-facts)))
+
+(defn- store-live-meta-facts
+  [fact-store]
+  (reduce-kv
+    (fn [acc rule-name _]
+      (if-let [meta-facts (store-live-meta-facts-for-rule fact-store rule-name)]
+        (assoc acc rule-name meta-facts)
+        acc))
+    {}
+    fact-store))
+
 (def ^:private ^:dynamic *mutable-session* nil)
 (def ^:private ^:dynamic *firing-rule-name* nil)
 (def ^:private ^:dynamic *recur-countdown* nil)
@@ -842,15 +890,15 @@ This is no longer necessary, because it is accessible via `match` directly."}
                                       (if (get-in session [:rule-name->node-id rule-name])
                                         session ;; rule already exists, skip (idempotent)
                                         (let [session (add-rule session rule)
-                                              ;; record provenance in rule-meta-store
+                                              ;; record provenance metadata in the unified store
                                               session (if-let [source (:source-rule opts)]
                                                         (-> session
-                                                            (assoc-in [:rule-meta-store rule-name ::derived-from] source)
+                                                            (insert-meta-facts-into-store rule-name {::derived-from source})
                                                             (insert-meta-facts-into-rete rule-name {::derived-from source}))
                                                         session)
                                               session (if (:root? opts)
                                                         (-> session
-                                                            (assoc-in [:rule-meta-store rule-name ::root?] true)
+                                                            (insert-meta-facts-into-store rule-name {::root? true})
                                                             (insert-meta-facts-into-rete rule-name {::root? true}))
                                                         session)]
                                           (initialize-rule-against-session session rule-name))))
@@ -1002,21 +1050,21 @@ This is no longer necessary, because it is accessible via `match` directly."}
                       (assoc-in [:node-id->rule-name leaf-node-id] (:name rule))
                       ;; assoc'ed by add-condition
                       (dissoc :mem-node-ids :join-node-ids :bindings))
-          ;; populate rule-meta-store unconditionally
+          ;; persist metadata in the unified fact store
           meta-facts (rule->meta-facts rule)
-          session (assoc-in session [:rule-meta-store (:name rule)] meta-facts)
-          ;; if this new rule is a meta-rule, replay all existing rule-meta-store entries through it
+          session (insert-meta-facts-into-store session (:name rule) meta-facts)
+          ;; if this new rule is a meta-rule, replay all existing metadata through it
           ;; (this handles: meta-rule added AFTER domain rules)
           session (if (rule-watches-meta? rule)
                     (reduce-kv
                       (fn [session existing-rule-name existing-meta]
                         (insert-meta-facts-into-rete session existing-rule-name existing-meta))
                       session
-                      (:rule-meta-store session))
+                      (store-live-meta-facts (:fact-store session)))
                     session)
           ;; insert this rule's metadata into RETE for any already-present meta-rules to react
           ;; (this handles: domain rule added AFTER meta-rules)
-          ;; insert silently discards facts that match no rule, so this is safe even without meta-rules
+          ;; uses the bypass path to avoid insert instrumentation conflict on ::o/rule
           session (insert-meta-facts-into-rete session (:name rule) meta-facts)]
       session)))
 
@@ -1049,16 +1097,17 @@ This is no longer necessary, because it is accessible via `match` directly."}
 (defn- cascade-remove-derived-rules
   "Recursively removes rules derived from the given rule, unless they are root rules."
   [session rule-name]
-  (let [derived-rules (reduce-kv
+  (let [meta-store (store-live-meta-facts (:fact-store session))
+        derived-rules (reduce-kv
                         (fn [acc rname meta]
                           (if (= (get meta ::derived-from) rule-name)
                             (conj acc rname)
                             acc))
                         []
-                        (:rule-meta-store session))]
+                        meta-store)]
     (reduce
       (fn [session derived-name]
-        (if (get-in session [:rule-meta-store derived-name ::root?])
+        (if (get-in meta-store [derived-name ::root?])
           session ;; root rules survive
           (remove-rule-safe session derived-name)))
       session
@@ -1068,7 +1117,8 @@ This is no longer necessary, because it is accessible via `match` directly."}
   "Removes a rule from the given session."
   [session rule-name]
   (if-let [node-id (get-in session [:rule-name->node-id rule-name])]
-    (let [meta-facts (get-in session [:rule-meta-store rule-name])
+    (let [meta-facts (or (store-live-meta-facts-for-rule (:fact-store session) rule-name)
+                         (get-in session [:rule-meta-store rule-name]))
           session (-> (loop [session session
                              node-id node-id]
                         (if node-id
@@ -1094,6 +1144,9 @@ This is no longer necessary, because it is accessible via `match` directly."}
                                               then-queue
                                               then-queue)))
                       (update :then-finally-queue disj node-id))
+          session (if meta-facts
+                    (retract-meta-facts-from-store session rule-name meta-facts)
+                    session)
           ;; clean up rule-meta-store
           session (update session :rule-meta-store dissoc rule-name)
           ;; retract metadata facts from RETE
@@ -1217,7 +1270,7 @@ This is no longer necessary, because it is accessible via `match` directly."}
 (defn insert
   "Inserts a fact into the session. Can optionally insert multiple facts with the same id.
   
-  Note: if the given fact doesn't match at least one rule, it will be discarded."
+  Facts are always retained in the session's fact-store, even if no rule currently matches."
   ([session [id attr value]]
    (insert session id attr value))
   ([session id attr->value]
@@ -1225,8 +1278,9 @@ This is no longer necessary, because it is accessible via `match` directly."}
                 (insert session id attr value))
               session attr->value))
   ([session id attr value]
-   (->> (get-alpha-nodes-for-fact session (:alpha-node session) id attr value true)
-        (upsert-fact session id attr value))))
+   (let [session (store-insert-into-session session id attr value)]
+     (->> (get-alpha-nodes-for-fact session (:alpha-node session) id attr value true)
+          (upsert-fact session id attr value)))))
 
 (s/def ::insert!-args
   (s/or
@@ -1259,16 +1313,24 @@ This is no longer necessary, because it is accessible via `match` directly."}
   "Retracts the fact with the given id + attr combo."
   [session id attr]
   (let [id+attr [id attr]
+        stored-entry (get-in session [:fact-store id attr])
+        session (store-retract-into-session session id attr)
         node-paths (get-in session [:id-attr-nodes id+attr])]
-    (when-not node-paths
-      (throw (ex-info (str id+attr " not in session") {})))
-    (reduce
-      (fn [session node-path]
-        (let [node (get-in session node-path)
-              fact (get-in node [:facts id attr])]
-          (right-activate-alpha-node session node-path (->Token fact :retract nil))))
+    (cond
+      (seq node-paths)
+      (reduce
+        (fn [session node-path]
+          (let [node (get-in session node-path)
+                fact (get-in node [:facts id attr])]
+            (right-activate-alpha-node session node-path (->Token fact :retract nil))))
+        session
+        node-paths)
+
+      stored-entry
       session
-      node-paths)))
+
+      :else
+      (throw (ex-info (str id+attr " not in session") {})))))
 
 (s/fdef retract!
   :args (s/cat :id ::id, :attr ::attr))
@@ -1311,18 +1373,16 @@ This is no longer necessary, because it is accessible via `match` directly."}
        (:matches rule)))))
 
 (defn query-all-meta
-  "Returns rule metadata from the rule-meta-store.
+  "Returns rule metadata from the unified fact store.
   With just a session, returns all rule metadata as a vector of [rule-name attr value] tuples.
   With a rule-name, returns the metadata map for that specific rule."
   ([session]
    (into []
          (mapcat (fn [[rule-name meta-facts]]
-                   (map (fn [[attr value]]
-                          [rule-name attr value])
-                        meta-facts)))
-         (:rule-meta-store session)))
+                   (map (fn [[attr value]] [rule-name attr value]) meta-facts)))
+         (store-live-meta-facts (:fact-store session))))
   ([session rule-name]
-   (get (:rule-meta-store session) rule-name)))
+   (store-live-meta-facts-for-rule (:fact-store session) rule-name)))
 
 (s/fdef reset!
   :args (s/cat :new-session ::session))

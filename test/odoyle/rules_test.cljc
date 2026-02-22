@@ -1111,7 +1111,7 @@
 
 ;; === Meta-rules (Phase 1) ===
 
-(deftest rule-meta-store-populated-on-add-rule
+(deftest rule-metadata-populated-on-add-rule
   (let [rules (o/ruleset
                 {::rule1
                  [:what
@@ -1126,6 +1126,9 @@
         session (reduce o/add-rule (o/->session) rules)
         meta1 (o/query-all-meta session ::rule1)
         meta2 (o/query-all-meta session ::rule2)]
+    (is (true? (get-in session [:fact-store ::rule1 ::o/rule :alive?])))
+    (is (true? (get-in session [:fact-store ::rule2 ::o/rule :alive?])))
+    (is (= {} (:rule-meta-store session)))
     ;; rule1 has all three blocks
     (is (true? (::o/rule meta1)))
     (is (true? (::o/has-when? meta1)))
@@ -1650,7 +1653,8 @@
         session (reduce o/add-rule (o/->session) rules)
         all-meta (o/query-all-meta session)]
     ;; all 100 rules should have metadata
-    (is (= 100 (count (:rule-meta-store session))))
+    (is (= 100 (count (set (map first all-meta)))))
+    (is (= {} (:rule-meta-store session)))
     ;; 6 meta-attrs per rule * 100 rules = 600 tuples
     (is (= 600 (count all-meta)))
     ;; spot-check a few rules with full content verification
@@ -1956,6 +1960,41 @@
            ;; tracker2 should also see all 3
            (is (= #{::tracker1 ::domain ::tracker2} @*tracker2-rules))
            session)))))
+
+(deftest insert-retains-unmatched-facts-in-store
+  (let [session (o/insert (o/->session) ::orphan ::color "blue")]
+    (is (= {:current "blue" :alive? true :history []}
+           (get-in session [:fact-store ::orphan ::color])))
+    (is (= #{[::orphan "blue"]}
+           (get-in session [:attr-index ::color])))
+    (is (= [] (o/query-all session)))))
+
+(deftest retract-tombstones-store-entry
+  (let [session (-> (o/->session)
+                    (o/insert ::orphan ::color "blue")
+                    (o/retract ::orphan ::color))]
+    (is (= {:current nil :alive? false :history ["blue"]}
+           (get-in session [:fact-store ::orphan ::color])))
+    (is (= {}
+           (:attr-index session)))))
+
+(deftest insert-overwrite-accumulates-history
+  (let [session (-> (o/->session)
+                    (o/insert ::user ::score 10)
+                    (o/insert ::user ::score 20)
+                    (o/insert ::user ::score 30))]
+    (is (= {:current 30 :alive? true :history [10 20]}
+           (get-in session [:fact-store ::user ::score])))
+    (is (= #{[::user 30]}
+           (get-in session [:attr-index ::score])))))
+
+(deftest add-rule-stores-meta-facts-in-fact-store
+  (let [session (-> (o/->session)
+                    (o/add-rule (first (o/ruleset {::demo-rule [:what [id ::color color]]}))))
+        meta-facts (o/query-all-meta session ::demo-rule)]
+    (is (true? (::o/rule meta-facts)))
+    (is (= true (get-in session [:fact-store ::demo-rule ::o/rule :current])))
+    (is (= true (get-in session [:fact-store ::demo-rule ::o/rule :alive?])))))
 
 #?(:clj
    (do

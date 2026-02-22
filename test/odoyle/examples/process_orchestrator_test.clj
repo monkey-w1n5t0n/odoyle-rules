@@ -45,7 +45,7 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- extract-transition-pairs
-  "Extracts #{[from-state to-state]} from rule-meta-store by introspecting
+  "Extracts #{[from-state to-state]} from a metadata map by introspecting
   transition rule conditions."
   [rule-meta-store]
   (reduce-kv
@@ -72,6 +72,15 @@
   (into #{:error}
         (mapcat (fn [[from to]] [from to]))
         pairs))
+
+(defn- query-all-meta-map
+  "Returns metadata as {rule-name {attr value}}."
+  [session]
+  (reduce
+    (fn [m [rule-name attr value]]
+      (assoc-in m [rule-name attr] value))
+    {}
+    (o/query-all-meta session)))
 
 ;; ---------------------------------------------------------------------------
 ;; Session builder
@@ -155,8 +164,8 @@
           :when
           (and (= "transition" (namespace rule-name))
                (some #(= (get-in % [:attr :value]) :order/state) conditions))
-          :then-finally
-          (let [pairs (extract-transition-pairs (:rule-meta-store session))
+         :then-finally
+          (let [pairs (extract-transition-pairs (query-all-meta-map session))
                 valid-states (extract-valid-states pairs)
                 correction-rule-name :validator/state-correction]
             ;; Only regenerate when valid-states actually changed
@@ -226,7 +235,7 @@
                                          :dead-end dead-state
                                          :fallback fallback})))})))))
             ;; Remove egress rules for states no longer dead ends
-            (doseq [[rn meta] (:rule-meta-store session)
+            (doseq [[rn meta] (query-all-meta-map session)
                     :when (= "emergency-egress" (namespace rn))]
               (let [egress-state (some #(when (= (get-in % [:attr :value]) :order/state)
                                           (get-in % [:value :value]))
@@ -246,8 +255,8 @@
           :when
           (and (= "transition" (namespace rule-name))
                (some #(= (get-in % [:attr :value]) :order/state) conditions))
-          :then-finally
-          (let [valid-pairs (extract-transition-pairs (:rule-meta-store session))
+         :then-finally
+          (let [valid-pairs (extract-transition-pairs (query-all-meta-map session))
                 rejection-rule-name :validator/rejection]
             ;; Only regenerate when valid-pairs actually changed
             (when (not= valid-pairs @*prev-valid-pairs)
